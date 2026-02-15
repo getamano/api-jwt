@@ -1,0 +1,107 @@
+<!--
+    - Policies are applied in the order they appear.
+    - Position <base/> inside a section to inherit policies from the outer scope.
+    - Comments within policies are not preserved.
+-->
+<!-- Add policies as children to the <inbound>, <outbound>, <backend>, and <on-error> elements -->
+<policies>
+    <!-- Throttle, authorize, validate, cache, or transform the requests -->
+    <inbound>
+        <base />
+        <!-- Extract API key from header -->
+        <set-variable name="api-key" value="@(context.Request.Headers.GetValueOrDefault("X-Api-Key", ""))" />
+        <!-- Validate key against backend -->
+        <send-request mode="new" response-variable-name="key-validation" timeout="10" ignore-error="false">
+            <set-url>{{backend-url}}/api/internal/validate-key</set-url>
+            <set-method>POST</set-method>
+            <set-header name="Content-Type" exists-action="override">
+                <value>application/json</value>
+            </set-header>
+            <set-body>@{
+                return new JObject(
+                    new JProperty("apiKey", (string)context.Variables["api-key"])
+                ).ToString();
+            }</set-body>
+        </send-request>
+        <!-- Parse validation response -->
+        <set-variable name="key-response" value="@(((IResponse)context.Variables["key-validation"]).Body.As<JObject>())" />
+        <set-variable name="key-active" value="@((bool)((JObject)context.Variables["key-response"])["active"])" />
+        <set-variable name="apim-subscription-id" value="@((string)(((JObject)context.Variables["key-response"])["apimSubscriptionId"] ?? ""))" />
+        <!-- Reject if key is invalid -->
+        <choose>
+            <when condition="@(!((bool)context.Variables["key-active"]))">
+                <return-response>
+                    <set-status code="401" reason="Unauthorized" />
+                    <set-header name="Content-Type" exists-action="override">
+                        <value>application/json</value>
+                    </set-header>
+                    <set-body>{"error": "Invalid or revoked API key"}</set-body>
+                </return-response>
+            </when>
+        </choose>
+        <!-- Set identity headers from validation response -->
+        <set-header name="X-User-Email" exists-action="override">
+            <value>@((string)((JObject)context.Variables["key-response"])["userId"])</value>
+        </set-header>
+        <set-header name="X-User-Tier" exists-action="override">
+            <value>@((string)((JObject)context.Variables["key-response"])["tier"])</value>
+        </set-header>
+        <set-header name="X-Key-Id" exists-action="override">
+            <value>@((string)((JObject)context.Variables["key-response"])["keyId"])</value>
+        </set-header>
+        <!-- Shared secret so backend trusts this came from APIM -->
+        <set-header name="X-Apim-Secret" exists-action="override">
+            <value>{{apim-backend-secret}}</value>
+        </set-header>
+        <!-- Strip the original API key so it doesn't reach the backend -->
+        <set-header name="X-Api-Key" exists-action="delete" />
+        <set-header name="Ocp-Apim-Subscription-Key" exists-action="delete" />
+        <set-header name="Authorization" exists-action="delete" />
+        <!-- Rate limit and quota by subscription ID -->
+        <rate-limit-by-key calls="5" renewal-period="1" counter-key="@((string)context.Variables["apim-subscription-id"])" remaining-calls-variable-name="rate-remaining" />
+        <quota-by-key calls="100" renewal-period="3600" counter-key="@((string)context.Variables["apim-subscription-id"])" />
+    </inbound>
+    <!-- Control if and how the requests are forwarded to services  -->
+    <backend>
+        <base />
+    </backend>
+    <!-- Customize the responses -->
+    <outbound>
+        <base />
+        <!-- Remove internal headers from response -->
+        <set-header name="X-Apim-Secret" exists-action="delete" />
+        <!-- Return tier to the caller -->
+        <set-header name="X-User-Tier" exists-action="override">
+            <value>@(context.Request.Headers.GetValueOrDefault("X-User-Tier", ""))</value>
+        </set-header>
+        <set-header name="X-Key-Active" exists-action="override">
+            <value>@(((bool)context.Variables["key-active"]).ToString().ToLower())</value>
+        </set-header>
+        <set-header name="X-RateLimit-Remaining" exists-action="override">
+            <value>@(context.Variables.ContainsKey("rate-remaining") ? ((int)context.Variables["rate-remaining"]).ToString() : "")</value>
+        </set-header>
+        <!-- Track usage to backend -->
+        <send-one-way-request mode="new">
+            <set-url>{{backend-url}}/api/internal/track-usage</set-url>
+            <set-method>POST</set-method>
+            <set-header name="Content-Type" exists-action="override">
+                <value>application/json</value>
+            </set-header>
+            <set-body>@{
+                return new JObject(
+                    new JProperty("keyId", (string)((JObject)context.Variables["key-response"])["keyId"]),
+                    new JProperty("userId", (string)((JObject)context.Variables["key-response"])["userId"]),
+                    new JProperty("tier", (string)((JObject)context.Variables["key-response"])["tier"]),
+                    new JProperty("operationId", context.Operation.Id),
+                    new JProperty("method", context.Request.Method),
+                    new JProperty("path", context.Request.Url.Path),
+                    new JProperty("statusCode", context.Response.StatusCode)
+                ).ToString();
+            }</set-body>
+        </send-one-way-request>
+    </outbound>
+    <!-- Handle exceptions and customize error responses  -->
+    <on-error>
+        <base />
+    </on-error>
+</policies>
